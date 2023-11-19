@@ -1,102 +1,94 @@
-#include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/sched.h>
-#include <linux/mm.h>
 #include <linux/hrtimer.h>
+#include <linux/ktime.h>
+#include <linux/mm.h>
+#include <linux/sched/mm.h>
+#include <linux/module.h>
 
 #define TIMER_INTERVAL_NS 10000000000ULL // 10 seconds in nanoseconds
 
-static struct hrtimer memory_timer;
-static struct task_struct *target_task;
+static struct hrtimer hr_timer;
 static int pid;
+static unsigned long rss_count = 0;
+static unsigned long wss_count = 0;
+static unsigned long swap_count = 0;
 
-static unsigned long rss_size = 0;
-static unsigned long swap_size = 0;
-static unsigned long wss_size = 0;
-
-// Callback function for the timer to measure working set size
-enum hrtimer_restart memory_measurement_callback(struct hrtimer *timer) {
+// Callback function for the timer to measure memory usage
+enum hrtimer_restart timer_callback(struct hrtimer *timer) {
+    struct task_struct *task;
     struct mm_struct *mm;
     struct vm_area_struct *vma;
     unsigned long address;
 
-    rss_size = 0;
-    swap_size = 0;
-    wss_size = 0;
-
-    // Find the task with the given PID
-    target_task = pid_task(find_vpid(pid), PIDTYPE_PID);
-    if (!target_task) {
+    task = pid_task(find_vpid(pid), PIDTYPE_PID);
+    if (!task) {
         printk(KERN_INFO "Process with PID %d not found\n", pid);
         return HRTIMER_NORESTART;
     }
 
-    mm = target_task->mm;
+    mm = task->mm;
     if (!mm) {
         printk(KERN_INFO "Process MM not accessible for PID %d\n", pid);
         return HRTIMER_NORESTART;
     }
 
-    // Traverse memory regions and walk through page tables
+    rss_count = 0;
+    wss_count = 0;
+    swap_count = 0;
+
+    // Traverse VMAs and walk through memory pages
     for (vma = mm->mmap; vma; vma = vma->vm_next) {
         for (address = vma->vm_start; address < vma->vm_end; address += PAGE_SIZE) {
-            pgd_t *pgd;
-            p4d_t *p4d;
-            pud_t *pud;
-            pmd_t *pmd;
             pte_t *ptep, pte;
+            spinlock_t *ptl;
 
-            pgd = pgd_offset(mm, address);
-            // Walk through the page table levels
-            // ... (similar to the page table walk example provided earlier)
-
-            // Count pages in RSS and SWAP
-            if (pte_present(pte)) {
-                rss_size++;
-            } else {
-                swap_size++;
-            }
-
-            // Measure working set size by checking accessed bit of page table entry
-            if (ptep_test_and_clear_young(vma, address, ptep)) {
-                wss_size++;
+            ptep = lookup_address(address, 0);
+            if (ptep) {
+                pte = *ptep;
+                spin_lock(ptl);
+                if (pte_present(pte)) {
+                    rss_count++;
+                    if (pte_young(pte)) {
+                        wss_count++;
+                        pte = pte_mkold(pte); // Mark as not recently used
+                        set_pte_at(mm, address, ptep, pte);
+                    }
+                } else {
+                    swap_count++;
+                }
+                spin_unlock(ptl);
             }
         }
     }
 
-    // Print statistics
-    printk(KERN_INFO "PID %d: RSS=%lu KB, SWAP=%lu KB, WSS=%lu KB\n", pid, rss_size * PAGE_SIZE / 1024, swap_size * PAGE_SIZE / 1024, wss_size * PAGE_SIZE / 1024);
+    // Log memory usage statistics
+    printk(KERN_INFO "PID %d: RSS=%lu KB, SWAP=%lu KB, WSS=%lu KB\n", pid,
+           (rss_count * PAGE_SIZE) / 1024, (swap_count * PAGE_SIZE) / 1024,
+           (wss_count * PAGE_SIZE) / 1024);
 
-    return HRTIMER_RESTART; // Restart the timer for next measurement
+    return HRTIMER_RESTART;
 }
 
-// Module parameter for PID
-module_param(pid, int, 0); // 0 means the parameter is not visible in sysfs
+static int __init timer_init(void) {
+    ktime_t ktime;
+    pid = 1234; // Replace with the PID you want to monitor
 
-// Module initialization
-static int __init memory_manager_init(void) {
-    printk(KERN_INFO "Memory Manager Module Initialized\n");
+    ktime = ktime_set(0, TIMER_INTERVAL_NS);
+    hrtimer_init(&hr_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+    hr_timer.function = &timer_callback;
 
-    // Initialize the timer
-    hrtimer_init(&memory_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-    memory_timer.function = &memory_measurement_callback;
-
-    // Start the timer
-    hrtimer_start(&memory_timer, ktime_set(0, TIMER_INTERVAL_NS), HRTIMER_MODE_REL);
+    hrtimer_start(&hr_timer, ktime, HRTIMER_MODE_REL);
 
     return 0;
 }
 
-// Module exit
-static void __exit memory_manager_exit(void) {
-    printk(KERN_INFO "Memory Manager Module Exited\n");
-
-    // Cancel the timer on module exit
-    hrtimer_cancel(&memory_timer);
+static void __exit timer_exit(void) {
+    hrtimer_cancel(&hr_timer);
+    printk(KERN_INFO "HR Timer module exiting\n");
 }
 
-module_init(memory_manager_init);
-module_exit(memory_manager_exit);
+module_init(timer_init);
+module_exit(timer_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Your Name");
